@@ -1,0 +1,185 @@
+#!/usr/bin/perl
+# (c) 2022 Pali Rohár <pali@kernel.org>, GPLv3
+
+use 5.00600;
+BEGIN { $^H = 0x6F2 } # use strict
+BEGIN { $^W = 1 } # use warnings
+
+my $tree = (defined $ARGV[0] and $ARGV[0] eq '-t');
+my $verbose = (defined $ARGV[0] and $ARGV[0] eq '-v');
+
+my %vendors;
+my %devices;
+my %classes;
+
+if (open my $ids, '<sdio.ids') {
+	my $current = '';
+	while (my $line = <$ids>) {
+		chomp $line;
+		next if $line =~ /^\s*$/;
+		next if $line =~ /^\s*#/;
+		if ($line =~ /^([0-9A-Fa-f]{4})\s+(.*)$/) {
+			$vendors{lc $1} = $2;
+			$current = lc $1;
+		} elsif ($line =~ /^\t([0-9A-Fa-f]{4})\s+(.*)$/) {
+			$devices{$current}{lc $1} = $2;
+		} elsif ($line =~ /^C\s+([0-9A-Fa-f]{2})\s+(.*)$/) {
+			$classes{lc $1} = $2;
+		} else {
+			warn "Invalid line $. in sdio.ids file\n";
+		}
+	}
+	close $ids;
+}
+
+if (opendir my $hosts, '/sys/class/mmc_host/') {
+	my @hosts = sort readdir $hosts;
+	closedir $hosts;
+	foreach my $host (@hosts) {
+		next unless $host =~ /^mmc/;
+		my $hostid = $host; $hostid =~ s/^mmc//;
+		print "Host $hostid:\n" if $tree;
+		if (opendir my $addresses, "/sys/class/mmc_host/$host/") {
+			my @addresses = sort readdir $addresses;
+			closedir $addresses;
+			foreach my $address (@addresses) {
+				next unless $address =~ /^\Q$host\E:/;
+				my $addressid = $address; $addressid =~ s/^\Q$host\E://;
+				my ($type, $cvendorid, $cdeviceid, $crevision, @cinfos);
+				if (open my $ctype, "</sys/class/mmc_host/$host/$address/type") {
+					local $/; $type = <$ctype>; $type =~ s/\s*$//;
+					close $ctype;
+				}
+				$type = '(none)' unless defined $type and length $type;
+				my $vdds = '';
+				if (open my $ocr, "</sys/class/mmc_host/$host/$address/ocr") {
+					local $/; my $vdd_bits = <$ocr>; $vdd_bits =~ s/\s*$//; $vdd_bits = hex($vdd_bits);
+					close $ocr;
+					my @vdd_bits = split //, substr unpack('b*', pack 'L', $vdd_bits), 8, 16;
+					push @vdd_bits, '0';
+					my $last;
+					for (my $i = 0; $i < $#vdd_bits; $i++) {
+						if ($vdd_bits[$i] eq '0' and defined $last) {
+							$vdds .= ', ' if length $vdds;
+							$vdds .= (($last+20)/10) . '-' . (($i-1+21)/10) . 'V';
+							undef $last;
+						} elsif ($vdd_bits[$i] eq '1' and not defined $last) {
+							$last = $i;
+						}
+					}
+				}
+				$vdds = '(none)' unless length $vdds;
+				if (open my $cvendor, "</sys/class/mmc_host/$host/$address/vendor") {
+					local $/; $cvendorid = <$cvendor>; $cvendorid =~ s/^0x//; $cvendorid =~ s/\s*$//;
+					close $cvendor;
+				}
+				if (open my $cdevice, "</sys/class/mmc_host/$host/$address/device") {
+					local $/; $cdeviceid = <$cdevice>; $cdeviceid =~ s/^0x//; $cdeviceid =~ s/\s*$//;
+					close $cdevice;
+				}
+				if (open my $crevisionfh, "</sys/class/mmc_host/$host/$address/revision") {
+					local $/; $crevision = <$crevisionfh>; $crevision =~ s/\s*$//;
+					close $crevisionfh;
+				}
+				for (1..4) {
+					if (open my $cinfo, "</sys/class/mmc_host/$host/$address/info$_") {
+						local $/;
+						$cinfos[$_] = <$cinfo>;
+						close $cinfo;
+						if (defined $cinfos[$_]) {
+							$cinfos[$_] =~ s/[\x00-\x1f\x7f]+/ /g;
+							$cinfos[$_] =~ s/\s*$//;
+						}
+					}
+				}
+				$cvendorid = '(na)' unless defined $cvendorid and length $cvendorid;
+				$cdeviceid = '(na)' unless defined $cdeviceid and length $cdeviceid;
+				$crevision = '(none)' unless defined $crevision and length $crevision;
+				my $cvendorinvalid = ($cvendorid ne '(na)' and hex($cvendorid) <= 0x00ff and (hex($cvendorid) == 0x007f or unpack('%8b*', chr(hex($cvendorid))) % 2 == 0));
+				my $cvendorname = $vendors{lc $cvendorid} || '';
+				my $cdevicename = $devices{lc $cvendorid}{lc $cdeviceid} || '';
+				my $addressdesc = '';
+				if ($type eq 'SDIO' or $type eq 'SDcombo') {
+					my $cdescription = $cvendorinvalid ? 'Device with invalid JEDEC vendor ID' : ($cvendorname . (length $cvendorname ? ' ' : '') . $cdevicename);
+					$addressdesc = " Common ID $cvendorid:$cdeviceid $cdescription";
+				}
+				print "  |__ Address $addressid:$addressdesc\n" if $tree;
+				if (opendir my $functions, "/sys/class/mmc_host/$host/$address/") {
+					my @functions = sort readdir $functions;
+					closedir $functions;
+					foreach my $function (@functions) {
+						next unless $function =~ /^\Q$address\E:/;
+						my $functionid = $function; $functionid =~ s/^\Q$address\E://;
+						my ($vendorid, $deviceid, $classid, $revision, @infos);
+						if (open my $vendor, "</sys/class/mmc_host/$host/$address/$function/vendor") {
+							local $/; $vendorid = <$vendor>; $vendorid =~ s/^0x//; $vendorid =~ s/\s*$//;
+							close $vendor;
+						}
+						if (open my $device, "</sys/class/mmc_host/$host/$address/$function/device") {
+							local $/; $deviceid = <$device>; $deviceid =~ s/^0x//; $deviceid =~ s/\s*$//;
+							close $device;
+						}
+						if (open my $revisionfh, "</sys/class/mmc_host/$host/$address/$function/revision") {
+							local $/; $revision = <$revisionfh>; $revision =~ s/\s*$//;
+							close $revisionfh;
+						}
+						if (open my $class, "</sys/class/mmc_host/$host/$address/$function/class") {
+							local $/; $classid = <$class>; $classid =~ s/^0x//; $classid =~ s/\s*$//;
+							close $class;
+						}
+						for (1..4) {
+							if (open my $info, "</sys/class/mmc_host/$host/$address/$function/info$_") {
+								local $/;
+								$infos[$_] = <$info>;
+								close $info;
+								if (defined $infos[$_]) {
+									$infos[$_] =~ s/[\x00-\x1f\x7f]+/ /g;
+									$infos[$_] =~ s/\s*$//;
+								}
+							}
+						}
+						my $driver = readlink "/sys/class/mmc_host/$host/$address/$function/driver";
+						$driver =~ s/.*\/// if defined $driver;
+						$vendorid = '(na)' unless defined $vendorid and length $vendorid;
+						$deviceid = '(na)' unless defined $deviceid and length $deviceid;
+						$revision = '(none)' unless defined $revision and length $revision;
+						$classid = '(na)' unless defined $classid and length $classid;
+						my $vendorinvalid = ($vendorid ne '(na)' and hex($vendorid) <= 0x00ff and (hex($vendorid) == 0x007f or unpack('%8b*', chr(hex($vendorid))) % 2 == 0));
+						my $vendorname = $vendors{lc $vendorid} || '';
+						my $devicename = $devices{lc $vendorid}{lc $deviceid} || '';
+						my $classname = $classes{lc $classid} || '';
+						my $description = $vendorinvalid ? 'Device with invalid JEDEC vendor ID' : ($vendorname . (length $vendorname ? ' ' : '') . $devicename);
+						if ($classid ne '(na)' and hex($classid) != 0x00) {
+							$description .= (length $description ? ' ' : '') . "(Class $classid" . (length $classname ? ": $classname" : '') . ')';
+						}
+						if ($tree) {
+							print "         |____ Function $functionid: ID $vendorid:$deviceid $description\n";
+						} else {
+							print "Host $hostid Address $addressid Function $functionid: ID $vendorid:$deviceid $description\n";
+							if ($verbose) {
+								print "    Common Address: 0x$addressid\n";
+								print "    Common VDD voltage: $vdds\n";
+								print "    Common Type: $type\n";
+								print "    Common Vendor ID: " . ($cvendorid ne '(na)' ? "0x$cvendorid" : '(none)') . (length $cvendorname ? " ($cvendorname)" : $cvendorinvalid ? ' (invalid)' : '') . "\n";
+								print "    Common Device ID: " . ($cdeviceid ne '(na)' ? "0x$cdeviceid" : '(none)') . (length $cdevicename ? " ($cdevicename)" : '') . "\n";
+								print "    Common Revision: $crevision\n";
+								for (1..4) {
+									print "    Common Info$_: $cinfos[$_]\n" if defined $cinfos[$_];
+								}
+								print "    Function ID: $functionid\n";
+								print "    Function Vendor ID: " . ($vendorid ne '(na)' ? "0x$vendorid" : '(none)') . (length $vendorname ? " ($vendorname)" : $vendorinvalid ? ' (invalid)' : '') . "\n";
+								print "    Function Device ID: " . ($deviceid ne '(na)' ? "0x$deviceid" : '(none)') . (length $devicename ? " ($devicename)" : '') . "\n";
+								print "    Function Class ID: " . ($classid ne '(na)' ? "0x$classid" : '(none)') . (length $classname ? " ($classname)" : '') . "\n";
+								print "    Function Revision: $revision\n";
+								for (1..4) {
+									print "    Function Info$_: $infos[$_]\n" if defined $infos[$_];
+								}
+								print "    Function Driver in use: " . (defined $driver ? $driver : "(none)") . "\n";
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
